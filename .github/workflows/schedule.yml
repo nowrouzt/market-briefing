@@ -38,7 +38,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install google-genai pytz
+        run: pip install google-generativeai pytz
 
       - name: Run briefing script
         env:
