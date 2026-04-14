@@ -21,8 +21,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 import pytz
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 
 
 # ─────────────────────────────────────────────
@@ -234,18 +233,14 @@ def generate_briefing(prompt: str) -> str:
     Sends the prompt to Gemini 2.0 Flash via the Google GenAI SDK
     with Google Search grounding enabled for live web data.
     """
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
-    response = client.models.generate_content(
-        model="gemini-1.5-flash-latest",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=8000,
-            temperature=0.4,
-        ),
+model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        tools=[{"google_search_retrieval": {}}]
     )
 
+    response = model.generate_content(prompt)
     return response.text
 
 
