@@ -1,0 +1,49 @@
+name: Market Intelligence Briefing
+
+# ─────────────────────────────────────────────
+#  SCHEDULE (all times in UTC)
+#
+#  UK times shown for reference:
+#    Winter (GMT = UTC+0): same as UTC
+#    Summer (BST = UTC+1): subtract 1 hour to get UTC
+#
+#  Mon–Fri 07:00 UTC → 7am GMT / 8am BST   (Morning)
+#  Mon–Fri 17:00 UTC → 5pm GMT / 6pm BST   (Evening)
+#  Saturday 08:00 UTC → 8am GMT / 9am BST  (Weekly Roundup)
+#  Sunday   08:00 UTC → 8am GMT / 9am BST  (Weekly Preview)
+# ─────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: "0 7 * * 1-5"   # Morning — Mon to Fri
+    - cron: "0 17 * * 1-5"  # Evening — Mon to Fri
+    - cron: "0 8 * * 6"     # Saturday roundup
+    - cron: "0 8 * * 0"     # Sunday preview
+
+  # Run manually from the Actions tab to test
+  workflow_dispatch:
+
+jobs:
+  send-briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install google-genai pytz
+
+      - name: Run briefing script
+        env:
+          GEMINI_API_KEY:  ${{ secrets.GEMINI_API_KEY }}
+          EMAIL_ADDRESS:   ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD:  ${{ secrets.EMAIL_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: python briefing.py
