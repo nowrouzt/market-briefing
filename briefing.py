@@ -190,7 +190,7 @@ def get_briefing_config():
 # ─────────────────────────────────────────────
 
 def generate_briefing(prompt):
-    api_key = os.environ["GEMINI_API_KEY"]
+    api_key = os.environ["GEMINI_API_KEY"].strip()
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
