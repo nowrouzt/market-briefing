@@ -24,8 +24,6 @@ import pytz
 # ─────────────────────────────────────────────
 
 RSS_FEEDS = [
-    ("Reuters Business",   "https://feeds.reuters.com/reuters/businessNews"),
-    ("Reuters Markets",    "https://feeds.reuters.com/reuters/money"),
     ("BBC Business",       "https://feeds.bbci.co.uk/news/business/rss.xml"),
     ("CNBC Markets",       "https://www.cnbc.com/id/20910258/device/rss/rss.html"),
     ("CNBC Finance",       "https://www.cnbc.com/id/10000664/device/rss/rss.html"),
@@ -40,7 +38,7 @@ HEADERS = {
 }
 
 
-def fetch_rss(name, url, max_items=15):
+def fetch_rss(name, url, max_items=6):
     """Fetch and parse a single RSS feed. Returns list of (title, summary, date) tuples."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -58,7 +56,7 @@ def fetch_rss(name, url, max_items=15):
             summary = (item.findtext("description") or
                        item.findtext("atom:summary", namespaces=ns) or "").strip()
             # Strip HTML tags from summary
-            summary = re.sub(r"<[^>]+>", "", summary)[:300]
+            summary = re.sub(r"<[^>]+>", "", summary)[:150]
 
             if title:
                 results.append(title + ((" — " + summary) if summary else ""))
