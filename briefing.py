@@ -418,7 +418,7 @@ def send_email(subject, html_body, plain_body):
     msg.attach(MIMEText(html_body, "html"))
 
     print("Connecting to Outlook SMTP...")
-    with smtplib.SMTP("smtp-mail.outlook.com", 587) as server:
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.ehlo()
         server.starttls()
         server.ehlo()
