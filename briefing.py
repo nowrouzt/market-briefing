@@ -1,8 +1,12 @@
 """
 ============================================================
   MARKET INTELLIGENCE BRIEFING — AUTO-DELIVERY SYSTEM
-  Powered by: Groq API (free) + RSS News Feeds (free)
-  No rate limit issues. No SDK. Completely reliable.
+  Powered by:
+    - yfinance     → live market prices (indices, FX, commodities)
+    - NewsAPI.org  → fresh financial news from last 12-24 hours
+    - Groq API     → AI analysis and briefing generation
+    - Gmail SMTP   → email delivery
+  All completely free. No hallucinated numbers.
 ============================================================
 """
 
@@ -14,224 +18,202 @@ import requests
 import xml.etree.ElementTree as ET
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone, timedelta
 import pytz
+import yfinance as yf
 
 
 # ─────────────────────────────────────────────
-#  RSS FEED SOURCES
+#  LIVE MARKET DATA via yfinance
 # ─────────────────────────────────────────────
 
-RSS_FEEDS = [
-    ("BBC Business",       "https://feeds.bbci.co.uk/news/business/rss.xml"),
-    ("CNBC Markets",       "https://www.cnbc.com/id/20910258/device/rss/rss.html"),
-    ("CNBC Finance",       "https://www.cnbc.com/id/10000664/device/rss/rss.html"),
-    ("Yahoo Finance",      "https://finance.yahoo.com/news/rssindex"),
-    ("MarketWatch",        "https://feeds.marketwatch.com/marketwatch/topstories/"),
-    ("Investing.com",      "https://www.investing.com/rss/news.rss"),
-    ("FT Markets",         "https://www.ft.com/markets?format=rss"),
-]
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; MarketBriefingBot/1.0)"
+TICKERS = {
+    # Equity indices
+    "S&P 500":       "^GSPC",
+    "Nasdaq":        "^IXIC",
+    "Dow Jones":     "^DJI",
+    "FTSE 100":      "^FTSE",
+    "DAX":           "^GDAXI",
+    "CAC 40":        "^FCHI",
+    "Nikkei 225":    "^N225",
+    "Hang Seng":     "^HSI",
+    # FX
+    "GBP/USD":       "GBPUSD=X",
+    "EUR/USD":       "EURUSD=X",
+    "USD/JPY":       "USDJPY=X",
+    "DXY":           "DX-Y.NYB",
+    # Commodities
+    "Brent Crude":   "BZ=F",
+    "Gold":          "GC=F",
+    "Natural Gas":   "NG=F",
+    # US Treasuries (yields %)
+    "US 2yr Yield":  "^IRX",
+    "US 10yr Yield": "^TNX",
 }
 
 
-def fetch_rss(name, url, max_items=6):
-    """Fetch and parse a single RSS feed. Returns list of (title, summary, date) tuples."""
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
+def fetch_market_data():
+    """Fetch live prices and daily % changes for all instruments."""
+    print("Fetching live market data from Yahoo Finance...")
+    lines = []
+    failed = []
 
-        # Handle both RSS and Atom formats
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        items = root.findall(".//item") or root.findall(".//atom:entry", ns)
+    for name, ticker in TICKERS.items():
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="2d", interval="1d")
 
-        results = []
-        for item in items[:max_items]:
-            title = (item.findtext("title") or
-                     item.findtext("atom:title", namespaces=ns) or "").strip()
-            summary = (item.findtext("description") or
-                       item.findtext("atom:summary", namespaces=ns) or "").strip()
-            # Strip HTML tags from summary
-            summary = re.sub(r"<[^>]+>", "", summary)[:150]
+            if len(hist) < 1:
+                failed.append(name)
+                continue
 
-            if title:
-                results.append(title + ((" — " + summary) if summary else ""))
+            current = hist["Close"].iloc[-1]
 
-        print("  [OK] " + name + ": " + str(len(results)) + " items")
-        return results
+            if len(hist) >= 2:
+                prev = hist["Close"].iloc[-2]
+                change = current - prev
+                pct = (change / prev) * 100
+                sign = "+" if change >= 0 else ""
+                lines.append(
+                    "{:<18} {:>10.2f}   ({}{:.2f} / {}{:.2f}%)".format(
+                        name + ":", current, sign, change, sign, pct
+                    )
+                )
+            else:
+                lines.append("{:<18} {:>10.2f}".format(name + ":", current))
 
-    except Exception as e:
-        print("  [SKIP] " + name + ": " + str(e))
-        return []
+        except Exception as e:
+            failed.append(name)
 
+    if failed:
+        print("  Could not fetch: " + ", ".join(failed))
 
-def gather_news():
-    """Fetch all RSS feeds and compile into a single news context string."""
-    print("Fetching live news from RSS feeds...")
-    all_items = []
-
-    for name, url in RSS_FEEDS:
-        items = fetch_rss(name, url)
-        if items:
-            all_items.append("=== " + name + " ===")
-            all_items.extend(["- " + item for item in items])
-            all_items.append("")
-
-    if not all_items:
-        return "No live news feeds available. Use your most recent training knowledge."
-
-    context = "\n".join(all_items)
-    print("News context compiled: " + str(len(context)) + " characters from " +
-          str(sum(1 for n, u in RSS_FEEDS)) + " sources")
-    return context
+    result = "\n".join(lines)
+    print("  Fetched " + str(len(lines)) + " instruments")
+    return result
 
 
 # ─────────────────────────────────────────────
-#  THE FOUR PROMPTS
+#  LIVE NEWS via NewsAPI.org
 # ─────────────────────────────────────────────
 
-def build_prompt(briefing_type, news_context, date_str):
+def fetch_news(hours_back=14):
+    """
+    Fetches recent financial and geopolitical news from NewsAPI.
+    Only returns articles published within the last `hours_back` hours.
+    Sorted newest first.
+    """
+    api_key = os.environ.get("NEWS_API_KEY", "").strip()
+    if not api_key:
+        print("  WARNING: NEWS_API_KEY not set. Skipping news fetch.")
+        return "News unavailable — NEWS_API_KEY not configured."
 
-    base_persona = (
-        "You are a world-class financial and geopolitical intelligence analyst. "
-        "I am pivoting into a career in financial markets and use your briefings "
-        "to stay sharp and build deep expertise. I am UK-based. "
-        "Below is a live feed of today's top financial and geopolitical news headlines. "
-        "Use these as your primary source of information to write the briefing. "
-        "Be analytical — don't just report what happened, explain WHY it matters "
-        "and the MECHANISM behind market moves. This is how I learn.\n\n"
-        "TODAY'S LIVE NEWS FEED:\n"
-        "------------------------\n"
-        + news_context +
-        "\n------------------------\n\n"
-        "Primary focus regions: US, UK, Eurozone, Japan. "
-        "Include others only if genuinely market-moving.\n\n"
-    )
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+    from_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    if briefing_type == "morning":
-        structure = """Write a MORNING MARKET BRIEFING for """ + date_str + """. Structure it exactly as follows:
+    # Two queries — market/finance news + geopolitics/macro
+    queries = [
+        {
+            "label": "Markets & Finance",
+            "params": {
+                "q": (
+                    "stock market OR S&P OR FTSE OR Fed OR ECB OR Bank of England "
+                    "OR interest rates OR inflation OR GDP OR earnings OR forex OR "
+                    "oil OR gold OR bonds OR recession OR tariffs OR trade"
+                ),
+                "language": "en",
+                "sortBy": "publishedAt",
+                "from": from_str,
+                "pageSize": 30,
+            }
+        },
+        {
+            "label": "Geopolitics & Global Affairs",
+            "params": {
+                "q": (
+                    "geopolitics OR sanctions OR China economy OR US economy "
+                    "OR Ukraine OR Middle East economy OR Trump policy "
+                    "OR central bank OR IMF OR World Bank OR OPEC"
+                ),
+                "language": "en",
+                "sortBy": "publishedAt",
+                "from": from_str,
+                "pageSize": 20,
+            }
+        }
+    ]
 
-**1. OVERNIGHT MARKET SNAPSHOT**
-Overnight/closing moves for: S&P 500, Nasdaq, Dow, FTSE 100, DAX, CAC 40, Nikkei 225, and notable Asian markets. Key FX: GBP/USD, EUR/USD, USD/JPY, DXY. Commodities: Brent Crude, Gold, notable movers. Crypto only if major. End with one sentence: the dominant theme or mood of overnight markets.
+    all_sections = []
+    total_articles = 0
 
-**2. MACRO PULSE**
-Overnight/morning data releases: inflation, jobs, PMIs, GDP, retail sales, central bank speeches. For each: the number, what was expected, and the market reaction. Flag tier-1 data due today.
+    for query in queries:
+        try:
+            resp = requests.get(
+                "https://newsapi.org/v2/everything",
+                params=query["params"],
+                headers={"X-Api-Key": api_key},
+                timeout=15
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-**3. CENTRAL BANK WATCH**
-Fed, ECB, BoE, Bank of Japan. Policy signals, rate decisions, speeches, forward guidance shifts. What is the market pricing in for the next meeting of each? Note divergences between central banks and why it matters for FX and bonds.
+            articles = data.get("articles", [])
+            if not articles:
+                continue
 
-**4. TOP 3 STORIES DRIVING MARKETS TODAY**
-The three most consequential developments from the last 12 hours. For each: what happened, why it is moving markets (explain the mechanism), and what to watch as it develops.
+            # Filter to only articles within our time window and deduplicate
+            seen_titles = set()
+            fresh = []
+            for article in articles:
+                published = article.get("publishedAt", "")
+                title = (article.get("title") or "").strip()
+                source = article.get("source", {}).get("name", "")
+                description = (article.get("description") or "").strip()
 
-**5. GEOPOLITICS AND GLOBAL AFFAIRS**
-Developments with real financial consequences. US politics/policy (tariffs, fiscal, regulation), US-China, Middle East, Russia-Ukraine, European politics, UK news.
+                # Skip removed/deleted articles
+                if title in ("[Removed]", "") or not title:
+                    continue
 
-**6. SECTORS, EARNINGS AND NOTABLE MOVERS**
-Significant earnings, analyst calls, M&A, IPOs, sector rotation. UK equity stories separately.
+                # Deduplicate
+                if title.lower() in seen_titles:
+                    continue
+                seen_titles.add(title.lower())
 
-**7. WHAT TO WATCH TODAY**
-Scheduled data releases, central bank speakers, earnings today, geopolitical deadlines. My agenda for the day.
+                # Parse timestamp
+                try:
+                    dt = datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc
+                    )
+                    age_hrs = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+                    age_str = "{:.0f}h ago".format(age_hrs)
+                    if dt < cutoff:
+                        continue  # Too old
+                except:
+                    age_str = "recent"
 
-**8. THE ANALYST'S TAKE**
-4-6 sentences. The single most important macro or market dynamic right now. The market narrative. What to watch over the next 24-48 hours. Briefly explain a concept where relevant — this is where I learn.
+                # Clean description
+                desc = re.sub(r"<[^>]+>", "", description)[:200] if description else ""
 
-Keep total length appropriate for a focused 15-20 minute read. Use bold headers and sub-bullets. Be precise with numbers."""
+                fresh.append(
+                    "  [" + age_str + "] [" + source + "] " + title +
+                    (" — " + desc if desc else "")
+                )
 
-    elif briefing_type == "evening":
-        structure = """Write an EVENING MARKET BRIEFING / DEBRIEF for """ + date_str + """. Structure it exactly as follows:
+            if fresh:
+                all_sections.append("=== " + query["label"] + " ===")
+                all_sections.extend(fresh)
+                all_sections.append("")
+                total_articles += len(fresh)
+                print("  [OK] " + query["label"] + ": " + str(len(fresh)) + " fresh articles")
 
-**1. TODAY'S MARKET CLOSE**
-Final closing numbers: S&P 500, Nasdaq, Dow, FTSE 100, DAX, CAC 40, Nikkei 225. Key FX closes: GBP/USD, EUR/USD, USD/JPY, DXY. Commodities: Brent, Gold, notable movers. US Treasury yields (2yr and 10yr) — note significant moves and explain why they matter. One sentence: the story of today's session.
+        except Exception as e:
+            print("  [FAIL] " + query["label"] + ": " + str(e)[:80])
 
-**2. WHY MARKETS MOVED THE WAY THEY DID**
-Most important section. The cause and effect of today's major moves. What was the catalyst? What was the mechanism? Was it macro data, Fed commentary, earnings, geopolitics, or flows? Explain the chain of reasoning the market used — not just what happened.
+    if not all_sections:
+        return "No recent news articles found in the last " + str(hours_back) + " hours."
 
-**3. TODAY'S TOP 3 STORIES**
-The three most impactful stories of the day. For each: what happened, the market reaction and why, and whether this is a one-day story or something with legs.
-
-**4. GEOPOLITICS AND GLOBAL AFFAIRS UPDATE**
-Developments with economic or market consequences. US policy, US-China, Middle East, Russia-Ukraine, European politics, UK domestic. Flag anything quietly building that markets may not be fully pricing yet.
-
-**5. DATA AND CENTRAL BANKS — TODAY'S SCORECARD**
-Economic data released today and how it shifted the macro picture. Central bank commentary and how it moved rate expectations. Where markets are pricing the next rate moves for Fed, ECB, BoE and BoJ.
-
-**6. EARNINGS, SECTORS AND CORPORATE NEWS**
-Notable earnings beats/misses and what they signal about the broader economy. Major M&A, analyst calls, sector moves. UK equity highlights separately.
-
-**7. WHAT'S SETTING UP FOR TOMORROW**
-Key data releases, central bank speakers, earnings, geopolitical events scheduled for tomorrow and the rest of the week. The known risk events.
-
-**8. THE ANALYST'S TAKE**
-4-6 sentences. The dominant narrative. Did anything surprise? What concept did today illustrate worth understanding more deeply? Leave me with the one thing I should be thinking about overnight.
-
-Keep total length appropriate for a focused 15-20 minute read. Be precise with numbers."""
-
-    elif briefing_type == "saturday":
-        structure = """Write a WEEKLY MARKET ROUNDUP covering the week just ended (Monday to Friday). Date: """ + date_str + """. Structure it exactly as follows:
-
-**1. WEEKLY MARKET SCORECARD**
-Full week performance: S&P 500, Nasdaq, Dow, FTSE 100, DAX, CAC 40, Nikkei 225. Weekly FX moves: GBP/USD, EUR/USD, USD/JPY, DXY — start vs finish. Commodities: Brent Crude, Gold, notable movers. US 2yr and 10yr Treasury yields — end vs Monday open. One sentence: the defining theme of markets this week.
-
-**2. THE WEEK'S NARRATIVE**
-Synthesise the overarching story of the week as a coherent narrative — NOT a day-by-day list. What was the market obsessing over? How did the narrative evolve from Monday to Friday? Were there turning points? What was the dominant risk sentiment and why?
-
-**3. THE TOP 5 STORIES OF THE WEEK**
-The five most consequential developments. For each: what happened and when, why it mattered to markets, the mechanism behind the reaction, and whether it is resolved or still developing.
-
-**4. CENTRAL BANKS THIS WEEK**
-Any Fed, ECB, BoE, or BoJ activity — decisions, minutes, speeches, guidance shifts. How did rate expectations shift across the week? Explain any central bank divergence and what it means for FX.
-
-**5. GEOPOLITICS AND GLOBAL AFFAIRS — THE WEEK IN REVIEW**
-Most significant geopolitical developments with real market consequences. US policy, US-China, Middle East, Russia-Ukraine, European politics, UK domestic.
-
-**6. SECTORS, EARNINGS AND CORPORATE HIGHLIGHTS**
-Most important earnings — beats, misses, and what they signal about the economy. Major M&A, IPOs, analyst calls. Sector rotation trends. UK equity highlights separately.
-
-**7. MACRO DATA ROUNDUP**
-All significant economic data released this week across US, UK, Eurozone, Japan. For each: what it showed, what was expected, and what it means for the macro picture.
-
-**8. CONCEPT OF THE WEEK**
-One market concept or mechanism that featured prominently this week — explained clearly and in depth so I genuinely understand it. Make it directly relevant to this week's events.
-
-**9. THE ANALYST'S WEEKLY TAKE**
-6-8 sentences. What was most important this week? What is the dominant macro regime right now and is it changing? What should I carry into next week as my core mental model?
-
-Aim for a thorough 25-30 minute read. Be precise with numbers and percentages."""
-
-    else:  # sunday
-        structure = """Write a WEEK AHEAD PREVIEW for the coming week. Date: """ + date_str + """. Structure it exactly as follows:
-
-**1. THE WEEK AHEAD — AT A GLANCE**
-8-10 bullet overview of the most important scheduled events in chronological order for the week ahead.
-
-**2. ECONOMIC DATA CALENDAR — THE BIG RELEASES**
-For each major release due this week across US, UK, Eurozone, Japan: what is being released and when (UK time), previous reading, market consensus expectation, why this release matters right now given the current macro environment, and what a beat or miss could mean for markets. Flag the single most important release of the week and why.
-
-**3. CENTRAL BANK EVENTS**
-Scheduled rate decisions, minutes, speeches, press conferences from Fed, ECB, BoE, BoJ. For each: what is expected, what the market is pricing in, and what surprise scenarios could move markets.
-
-**4. EARNINGS SEASON WATCH**
-Key companies reporting this week. For each major release: market expectations, what to watch beyond headline numbers, and what results could signal about the broader economy or sector.
-
-**5. GEOPOLITICAL CALENDAR AND FLASHPOINTS**
-Scheduled political events with market impact. Flag slow-burning situations that could escalate this week.
-
-**6. KEY RISKS THIS WEEK**
-3-5 specific risk scenarios — both upside and downside surprises — with the potential market impact of each.
-
-**7. THEMES TO WATCH**
-The 2-3 overarching macro themes or narratives that will likely dominate the week's trading and how this week's events feed into them.
-
-**8. HOW TO THINK ABOUT THIS WEEK**
-5-6 sentences. What is the market's key question right now? What single event is most likely to shift the macro narrative? Where could the consensus be wrong? Leave me with a clear mental model to carry into Monday.
-
-Aim for a thorough 20-25 minute read. Include specific dates, UK times, and consensus forecasts where available."""
-
-    return base_persona + structure
+    print("  Total fresh articles: " + str(total_articles))
+    return "\n".join(all_sections)
 
 
 # ─────────────────────────────────────────────
@@ -245,28 +227,246 @@ def get_briefing_config():
     date_str = now.strftime("%A, %d %B %Y")
 
     if day == 5:
-        return "saturday", "Weekly Market Roundup — " + date_str
+        return "saturday", "Weekly Market Roundup — " + date_str, 36
     elif day == 6:
-        return "sunday", "Week Ahead Preview — " + date_str
+        return "sunday", "Week Ahead Preview — " + date_str, 36
     elif now.hour < 14:
-        return "morning", "Morning Market Briefing — " + date_str
+        return "morning", "Morning Market Briefing — " + date_str, 14
     else:
-        return "evening", "Evening Market Briefing — " + date_str
+        return "evening", "Evening Market Briefing — " + date_str, 14
 
 
 # ─────────────────────────────────────────────
-#  CALL GROQ API (FREE, RELIABLE, FAST)
+#  BUILD PROMPT
+# ─────────────────────────────────────────────
+
+def build_prompt(briefing_type, market_data, news_context, subject):
+
+    base = (
+        "You are a world-class financial and geopolitical intelligence analyst. "
+        "I am pivoting into a career in financial markets and use your briefings "
+        "to stay sharp and build deep expertise. I am UK-based.\n\n"
+
+        "CRITICAL RULES:\n"
+        "1. The LIVE MARKET DATA below contains real prices fetched moments ago. "
+        "Use these EXACT figures. Do NOT change, estimate, or invent any numbers.\n"
+        "2. The NEWS section contains ONLY articles published in the last 12-24 hours. "
+        "These are your source for what is happening right now. "
+        "Do NOT reference events or data not in this news feed.\n"
+        "3. If a specific data point is unavailable, say so — never guess.\n"
+        "4. Explain WHY things are moving — the mechanism, the cause and effect. "
+        "This is how I learn, not just stay informed.\n\n"
+
+        "━━━ LIVE MARKET DATA (exact figures — use these verbatim) ━━━\n"
+        + market_data +
+        "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "━━━ RECENT NEWS (last 12-24 hours only) ━━━\n"
+        + news_context +
+        "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "Primary focus: US, UK, Eurozone, Japan. Include others only if genuinely significant.\n\n"
+    )
+
+    if briefing_type == "morning":
+        structure = (
+            "Write a MORNING MARKET BRIEFING for " + subject + ".\n\n"
+
+            "**1. OVERNIGHT MARKET SNAPSHOT**\n"
+            "Use EXACT figures from the live market data above. "
+            "Cover: S&P 500, Nasdaq, Dow, FTSE 100, DAX, CAC 40, Nikkei 225, Hang Seng. "
+            "FX: GBP/USD, EUR/USD, USD/JPY, DXY. "
+            "Commodities: Brent Crude, Gold. "
+            "US 2yr and 10yr yields — briefly explain what any significant move signals. "
+            "End with one sentence: the dominant theme of overnight markets.\n\n"
+
+            "**2. MACRO PULSE**\n"
+            "Report ONLY macro data that appears in today's news feed above — "
+            "do not invent or recall data releases. For each: the actual number, "
+            "what was expected, and the market reaction. Flag tier-1 data due today.\n\n"
+
+            "**3. CENTRAL BANK WATCH**\n"
+            "Based only on today's news feed: Fed, ECB, BoE, BoJ policy signals, "
+            "speeches, or guidance shifts. What is the market pricing for each next meeting? "
+            "Note any divergence between central banks and why it matters for FX and bonds.\n\n"
+
+            "**4. TOP 3 STORIES DRIVING MARKETS TODAY**\n"
+            "The three most consequential stories from today's news feed. "
+            "For each: what happened, why it is moving markets (explain the mechanism), "
+            "and what to watch as it develops.\n\n"
+
+            "**5. GEOPOLITICS AND GLOBAL AFFAIRS**\n"
+            "Key developments from today's news with real financial consequences. "
+            "US politics/policy (tariffs, fiscal, regulation), US-China, Middle East, "
+            "Russia-Ukraine, European politics, UK news.\n\n"
+
+            "**6. SECTORS, EARNINGS AND NOTABLE MOVERS**\n"
+            "Significant earnings, analyst calls, M&A, IPOs from today's news. "
+            "UK equity stories separately.\n\n"
+
+            "**7. WHAT TO WATCH TODAY**\n"
+            "Based on today's news: scheduled data releases, central bank speakers, "
+            "earnings, geopolitical deadlines. My agenda for the day.\n\n"
+
+            "**8. THE ANALYST'S TAKE**\n"
+            "4-6 sentences. The single most important dynamic right now. "
+            "The market narrative. What to watch over the next 24-48 hours. "
+            "Briefly explain a concept where relevant — this is where I learn.\n\n"
+
+            "15-20 minute read. Bold headers. Sub-bullets. Exact numbers only."
+        )
+
+    elif briefing_type == "evening":
+        structure = (
+            "Write an EVENING MARKET BRIEFING / DEBRIEF for " + subject + ".\n\n"
+
+            "**1. TODAY'S MARKET CLOSE**\n"
+            "Use EXACT figures from the live market data above. "
+            "S&P 500, Nasdaq, Dow, FTSE 100, DAX, CAC 40, Nikkei 225. "
+            "FX: GBP/USD, EUR/USD, USD/JPY, DXY. Commodities: Brent, Gold. "
+            "US 2yr and 10yr yields — what do any significant moves signal? "
+            "One sentence: the story of today's session.\n\n"
+
+            "**2. WHY MARKETS MOVED THE WAY THEY DID**\n"
+            "Most important section. Using today's news as evidence, explain the "
+            "cause and effect of today's major moves. What was the catalyst? "
+            "What was the mechanism? Explain the chain of reasoning the market used.\n\n"
+
+            "**3. TODAY'S TOP 3 STORIES**\n"
+            "The three most impactful stories from today's news feed. "
+            "For each: what happened, the market reaction and why, "
+            "and whether this is a one-day story or something with legs.\n\n"
+
+            "**4. GEOPOLITICS AND GLOBAL AFFAIRS UPDATE**\n"
+            "From today's news: developments with economic or market consequences. "
+            "US policy, US-China, Middle East, Russia-Ukraine, European politics, UK. "
+            "Flag anything quietly building that markets may not be fully pricing yet.\n\n"
+
+            "**5. DATA AND CENTRAL BANKS — TODAY'S SCORECARD**\n"
+            "From today's news only: economic data released today and what it means "
+            "for the macro picture. Central bank commentary and rate expectations. "
+            "Where markets are pricing the next moves for Fed, ECB, BoE and BoJ.\n\n"
+
+            "**6. EARNINGS, SECTORS AND CORPORATE NEWS**\n"
+            "From today's news: earnings beats/misses and what they signal. "
+            "Major M&A, analyst calls, sector moves. UK highlights separately.\n\n"
+
+            "**7. WHAT'S SETTING UP FOR TOMORROW**\n"
+            "Based on today's news: key data releases, central bank speakers, "
+            "earnings and geopolitical events scheduled for tomorrow and this week.\n\n"
+
+            "**8. THE ANALYST'S TAKE**\n"
+            "4-6 sentences. The dominant narrative today. Did anything surprise? "
+            "What concept did today illustrate worth understanding? "
+            "The one thing I should be thinking about overnight.\n\n"
+
+            "15-20 minute read. Bold headers. Sub-bullets. Exact numbers only."
+        )
+
+    elif briefing_type == "saturday":
+        structure = (
+            "Write a WEEKLY MARKET ROUNDUP for the week just ended. "
+            "Date: " + subject + ".\n\n"
+
+            "**1. WEEKLY MARKET SCORECARD**\n"
+            "Use EXACT current figures from the live market data above. "
+            "S&P 500, Nasdaq, Dow, FTSE 100, DAX, CAC 40, Nikkei 225. "
+            "FX: GBP/USD, EUR/USD, USD/JPY, DXY. Brent Crude, Gold. "
+            "US 2yr and 10yr yields. One sentence: the defining theme of this week.\n\n"
+
+            "**2. THE WEEK'S NARRATIVE**\n"
+            "Using the news feed as your source, synthesise the overarching story "
+            "of the week as a coherent narrative — NOT a day-by-day list. "
+            "What did markets obsess over? How did the narrative evolve? "
+            "Were there turning points? What was the dominant risk sentiment?\n\n"
+
+            "**3. THE TOP 5 STORIES OF THE WEEK**\n"
+            "The five most consequential developments from the news feed. "
+            "For each: what happened, why it mattered, the mechanism behind "
+            "the market reaction, and whether it is resolved or developing.\n\n"
+
+            "**4. CENTRAL BANKS THIS WEEK**\n"
+            "Any Fed, ECB, BoE, or BoJ activity from the news feed. "
+            "How did rate expectations shift? Explain any divergence and "
+            "what it means for FX.\n\n"
+
+            "**5. GEOPOLITICS AND GLOBAL AFFAIRS — THE WEEK IN REVIEW**\n"
+            "Most significant geopolitical developments with real market consequences.\n\n"
+
+            "**6. SECTORS, EARNINGS AND CORPORATE HIGHLIGHTS**\n"
+            "Most important earnings — beats, misses, what they signal. "
+            "Major M&A, IPOs, analyst calls. Sector rotation trends. UK highlights.\n\n"
+
+            "**7. MACRO DATA ROUNDUP**\n"
+            "From the news feed only: all significant economic data this week. "
+            "For each: what it showed, what was expected, what it means.\n\n"
+
+            "**8. CONCEPT OF THE WEEK**\n"
+            "One market concept or mechanism that featured prominently this week — "
+            "explained clearly and in depth, directly relevant to this week's events.\n\n"
+
+            "**9. THE ANALYST'S WEEKLY TAKE**\n"
+            "6-8 sentences. What was most important? What is the dominant macro regime? "
+            "Is it changing? What should I carry into next week as my core mental model?\n\n"
+
+            "25-30 minute read. Precise numbers. Bold headers."
+        )
+
+    else:  # sunday
+        structure = (
+            "Write a WEEK AHEAD PREVIEW for the coming week. "
+            "Date: " + subject + ".\n\n"
+
+            "**1. THE WEEK AHEAD — AT A GLANCE**\n"
+            "8-10 bullet overview of the most important scheduled events "
+            "in chronological order.\n\n"
+
+            "**2. ECONOMIC DATA CALENDAR — THE BIG RELEASES**\n"
+            "For each major release due this week across US, UK, Eurozone, Japan: "
+            "what is being released and when (UK time), previous reading, "
+            "market consensus expectation, why it matters right now, "
+            "and what a beat or miss could mean for markets. "
+            "Flag the single most important release and why.\n\n"
+
+            "**3. CENTRAL BANK EVENTS**\n"
+            "Scheduled decisions, minutes, speeches from Fed, ECB, BoE, BoJ. "
+            "For each: what is expected, what the market is pricing in, "
+            "and what surprise scenarios could move markets.\n\n"
+
+            "**4. EARNINGS SEASON WATCH**\n"
+            "Key companies reporting this week. For each: market expectations, "
+            "what to watch beyond headlines, what results could signal.\n\n"
+
+            "**5. GEOPOLITICAL CALENDAR AND FLASHPOINTS**\n"
+            "Scheduled political events with market impact. "
+            "Flag slow-burning situations that could escalate.\n\n"
+
+            "**6. KEY RISKS THIS WEEK**\n"
+            "3-5 specific risk scenarios — upside and downside — "
+            "with the potential market impact of each.\n\n"
+
+            "**7. THEMES TO WATCH**\n"
+            "The 2-3 overarching macro themes that will dominate the week's trading.\n\n"
+
+            "**8. HOW TO THINK ABOUT THIS WEEK**\n"
+            "5-6 sentences. The market's key question right now. "
+            "What single event is most likely to shift the macro narrative? "
+            "Where could the consensus be wrong? "
+            "A clear mental model to carry into Monday.\n\n"
+
+            "20-25 minute read. Specific dates, UK times, consensus forecasts. "
+            "Use the live market data for current levels."
+        )
+
+    return base + structure
+
+
+# ─────────────────────────────────────────────
+#  CALL GROQ API
 # ─────────────────────────────────────────────
 
 def generate_briefing(full_prompt):
     api_key = os.environ["GROQ_API_KEY"].strip()
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-
-    headers = {
-        "Authorization": "Bearer " + api_key,
-        "Content-Type": "application/json"
-    }
 
     payload = {
         "model": "llama-3.3-70b-versatile",
@@ -274,29 +474,34 @@ def generate_briefing(full_prompt):
             {
                 "role": "system",
                 "content": (
-                    "You are a world-class financial market analyst and intelligence briefer. "
-                    "You write clear, precise, analytical briefings that explain not just what "
-                    "happened in markets but why — the mechanisms, the cause and effect, the "
-                    "implications. You write for someone building serious expertise in financial "
-                    "markets. Always be precise with numbers. Always explain market mechanisms."
+                    "You are a world-class financial market analyst. "
+                    "You write precise, analytical briefings that explain market mechanisms. "
+                    "When live market data is provided, always use those exact figures — "
+                    "never substitute, estimate, or invent numbers you have been given. "
+                    "When a news feed is provided, only reference events from that feed — "
+                    "never invent or recall events not present in the feed."
                 )
             },
-            {
-                "role": "user",
-                "content": full_prompt
-            }
+            {"role": "user", "content": full_prompt}
         ],
         "max_tokens": 8000,
-        "temperature": 0.4
+        "temperature": 0.3
     }
 
-    print("Calling Groq API (llama-3.3-70b-versatile)...")
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    print("Calling Groq API...")
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        timeout=120
+    )
     resp.raise_for_status()
 
-    data = resp.json()
-    text = data["choices"][0]["message"]["content"]
-    print("Groq response received: " + str(len(text)) + " characters")
+    text = resp.json()["choices"][0]["message"]["content"]
+    print("Groq response: " + str(len(text)) + " characters")
     return text
 
 
@@ -304,14 +509,13 @@ def generate_briefing(full_prompt):
 #  FORMAT AS HTML EMAIL
 # ─────────────────────────────────────────────
 
-def convert_to_html(subject, raw_text):
+def convert_to_html(subject, raw_text, market_data):
     lines = raw_text.split("\n")
     html_lines = []
     in_list = False
 
     for line in lines:
         stripped = line.strip()
-
         is_header = (
             stripped.startswith("**") and
             stripped.endswith("**") and
@@ -325,8 +529,7 @@ def convert_to_html(subject, raw_text):
                 in_list = False
             content = stripped.strip("*")
             html_lines.append('<h2 class="sh">' + content + "</h2>")
-
-        elif stripped.startswith("- "):
+        elif stripped.startswith("- ") or stripped.startswith("* "):
             if not in_list:
                 html_lines.append("<ul>")
                 in_list = True
@@ -334,26 +537,15 @@ def convert_to_html(subject, raw_text):
             content = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", content)
             content = re.sub(r"\*(.*?)\*", r"<em>\1</em>", content)
             html_lines.append("<li>" + content + "</li>")
-
-        elif stripped.startswith("* "):
-            if not in_list:
-                html_lines.append("<ul>")
-                in_list = True
-            content = stripped[2:]
-            content = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", content)
-            html_lines.append("<li>" + content + "</li>")
-
         elif stripped == "---":
             if in_list:
                 html_lines.append("</ul>")
                 in_list = False
             html_lines.append('<hr class="d">')
-
         elif stripped == "":
             if in_list:
                 html_lines.append("</ul>")
                 in_list = False
-
         else:
             if in_list:
                 html_lines.append("</ul>")
@@ -368,6 +560,22 @@ def convert_to_html(subject, raw_text):
 
     body = "\n".join(html_lines)
 
+    # Market data snapshot box
+    mkt_rows = ""
+    for line in market_data.strip().split("\n"):
+        if line.strip():
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                name_part = " ".join(p for p in parts if not p.replace(".", "").replace("-", "").replace("+", "").replace("%", "").replace("(", "").replace(")", "").replace("/", "").isnumeric() and not p.startswith("+") and not p.startswith("-") and not p.startswith("("))
+                val_part = " ".join(p for p in parts if p not in name_part.split())
+                color = "green" if "+" in val_part else ("#cc0000" if any(c in val_part for c in ["-"]) else "#333")
+                mkt_rows += (
+                    "<tr><td style='padding:3px 12px 3px 0;color:#555;font-size:13px;white-space:nowrap'>"
+                    + line.split(":")[0].strip() + "</td>"
+                    "<td style='padding:3px 0;font-size:13px;color:" + color + ";font-family:monospace;white-space:nowrap'>"
+                    + (":".join(line.split(":")[1:])).strip() + "</td></tr>"
+                )
+
     return (
         "<!DOCTYPE html><html lang='en'><head>"
         "<meta charset='UTF-8'>"
@@ -375,10 +583,14 @@ def convert_to_html(subject, raw_text):
         "<title>" + subject + "</title>"
         "<style>"
         "body{font-family:Georgia,serif;background:#f4f4f0;margin:0;padding:20px;color:#1a1a1a}"
-        ".wrap{max-width:720px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08)}"
+        ".wrap{max-width:760px;margin:0 auto;background:#fff;border-radius:8px;"
+        "overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08)}"
         ".hdr{background:#0a2540;padding:28px 36px;color:#fff}"
         ".hdr h1{margin:0;font-size:22px;font-weight:700}"
         ".hdr p{margin:6px 0 0;font-size:13px;color:#8aa4c8;font-family:Arial,sans-serif}"
+        ".mkt{background:#f8fafb;border-bottom:1px solid #e0e8f0;padding:16px 36px}"
+        ".mkt h3{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:1px;"
+        "color:#8aa4c8;font-family:Arial,sans-serif}"
         ".body{padding:32px 36px;line-height:1.8}"
         "h2.sh{font-size:16px;color:#0a2540;margin:32px 0 10px;padding:10px 14px;"
         "background:#f0f4fa;border-left:4px solid #1a73e8;border-radius:0 4px 4px 0}"
@@ -393,15 +605,20 @@ def convert_to_html(subject, raw_text):
         "<div class='wrap'>"
         "<div class='hdr'><h1>" + subject + "</h1>"
         "<p>Your personal market intelligence briefing &mdash; generated automatically</p></div>"
+        "<div class='mkt'><h3>Live Market Snapshot</h3>"
+        "<table border='0' cellpadding='0' cellspacing='0'>" + mkt_rows + "</table></div>"
         "<div class='body'>" + body + "</div>"
-        "<div class='ftr'>Generated by your market intelligence system &nbsp;&bull;&nbsp; "
-        "Powered by Groq + Live RSS News Feeds &nbsp;&bull;&nbsp; Free</div>"
+        "<div class='ftr'>"
+        "Live prices: Yahoo Finance &nbsp;&bull;&nbsp; "
+        "News: NewsAPI.org (last 12-24hrs) &nbsp;&bull;&nbsp; "
+        "Analysis: Groq &nbsp;&bull;&nbsp; Free"
+        "</div>"
         "</div></body></html>"
     )
 
 
 # ─────────────────────────────────────────────
-#  SEND EMAIL VIA OUTLOOK SMTP
+#  SEND EMAIL VIA GMAIL SMTP
 # ─────────────────────────────────────────────
 
 def send_email(subject, html_body, plain_body):
@@ -417,7 +634,7 @@ def send_email(subject, html_body, plain_body):
     msg.attach(MIMEText(plain_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
-    print("Connecting to Outlook SMTP...")
+    print("Connecting to Gmail SMTP...")
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.ehlo()
         server.starttls()
@@ -438,20 +655,15 @@ def main():
     print(datetime.now(uk_tz).strftime("%Y-%m-%d %H:%M %Z"))
     print("=" * 50)
 
-    briefing_type, subject = get_briefing_config()
+    briefing_type, subject, hours_back = get_briefing_config()
     print("Briefing type: " + subject)
 
-    # Step 1: Gather live news
-    news_context = gather_news()
+    market_data  = fetch_market_data()
+    news_context = fetch_news(hours_back=hours_back)
+    full_prompt  = build_prompt(briefing_type, market_data, news_context, subject)
+    raw_text     = generate_briefing(full_prompt)
+    html_body    = convert_to_html(subject, raw_text, market_data)
 
-    # Step 2: Build full prompt
-    full_prompt = build_prompt(briefing_type, news_context, subject)
-
-    # Step 3: Generate briefing via Groq
-    raw_text = generate_briefing(full_prompt)
-
-    # Step 4: Format and send
-    html_body = convert_to_html(subject, raw_text)
     send_email(subject, html_body, raw_text)
 
     print("=" * 50)
