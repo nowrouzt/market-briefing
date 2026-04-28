@@ -112,19 +112,49 @@ def fetch_news(hours_back=14):
     from_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Two queries — market/finance news + geopolitics/macro
-    queries = [
+     queries = [
         {
             "label": "Markets & Finance",
             "params": {
                 "q": (
-                    "stock market OR S&P OR FTSE OR Fed OR ECB OR Bank of England "
-                    "OR interest rates OR inflation OR GDP OR earnings OR forex OR "
-                    "oil OR gold OR bonds OR recession OR tariffs OR trade"
+                    "stock market OR S&P 500 OR FTSE OR Nasdaq OR DAX OR Nikkei "
+                    "OR earnings OR forex OR oil OR gold OR bonds OR tariffs OR trade "
+                    "OR recession OR inflation OR interest rates OR GDP"
                 ),
                 "language": "en",
                 "sortBy": "publishedAt",
                 "from": from_str,
-                "pageSize": 30,
+                "pageSize": 25,
+            }
+        },
+        {
+            "label": "Macro Data Releases",
+            "params": {
+                "q": (
+                    "Consumer Confidence OR PMI OR CPI OR inflation data OR jobs report "
+                    "OR unemployment OR retail sales OR GDP growth OR industrial output "
+                    "OR housing starts OR trade balance OR payrolls OR economic data "
+                    "OR business confidence OR manufacturing output OR services sector"
+                ),
+                "language": "en",
+                "sortBy": "publishedAt",
+                "from": from_str,
+                "pageSize": 25,
+            }
+        },
+        {
+            "label": "Central Bank Speeches & Policy",
+            "params": {
+                "q": (
+                    "Lagarde OR Powell OR Bailey OR Ueda OR Schnabel OR Waller "
+                    "OR Fed speech OR ECB speech OR Bank of England speech "
+                    "OR Federal Reserve OR rate decision OR monetary policy "
+                    "OR rate hike OR rate cut OR forward guidance OR hawkish OR dovish"
+                ),
+                "language": "en",
+                "sortBy": "publishedAt",
+                "from": from_str,
+                "pageSize": 25,
             }
         },
         {
@@ -132,8 +162,8 @@ def fetch_news(hours_back=14):
             "params": {
                 "q": (
                     "geopolitics OR sanctions OR China economy OR US economy "
-                    "OR Ukraine OR Middle East economy OR Trump policy "
-                    "OR central bank OR IMF OR World Bank OR OPEC"
+                    "OR Ukraine OR Middle East OR Trump policy OR OPEC "
+                    "OR IMF OR World Bank OR trade war OR supply chain"
                 ),
                 "language": "en",
                 "sortBy": "publishedAt",
